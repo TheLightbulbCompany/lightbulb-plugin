@@ -2,5 +2,6 @@
   "name": "lightbulb",
   "description": "Lightbulb in Claude Code: the lightbulb MCP server, the session-sharing skill, and the session-sharing band.",
   "types": "./types/index.d.ts",
-  "version": "0.1.3"
+  "hooks": "./mod/hooks.json",
+  "version": "0.1.4"
 }
