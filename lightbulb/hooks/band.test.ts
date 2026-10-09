@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { bandLine, bandRuns, continuedLine, keysHint, parseContinued, rememberTyped, typist } from './state'
+import { bandLine, bandRuns, continuedLine, GO_LIVE_LINE, keysHint, ONLY_YOU_LINE, parseContinued, rememberTyped, STOPPING_LINE, typist } from './state'
 import { colorFor, type Sender } from './rules'
 import type { SessionState } from '../types'
 
@@ -80,9 +80,9 @@ test('the band draws watcher names and the asker in their colors', async ($, on)
   }
 })
 
-test('band says transcript for a plain session, and paused wins', () => {
-  expect(bandLine({ ...base, terminal: null })).toBe('● Shared as a transcript')
-  expect(bandLine({ ...base, paused: true })).toBe('○ Sharing paused')
+test('band says shared for a session with no terminal, and Only you wins', () => {
+  expect(bandLine({ ...base, terminal: null })).toBe('● Shared in Lightbulb')
+  expect(bandLine({ ...base, paused: true })).toBe(ONLY_YOU_LINE)
 })
 
 test('band shows nothing when the app does not answer', async ($, on) => {
@@ -236,15 +236,15 @@ test('a poll that resolves a refused decision clears its error line', async ($, 
   await ui.unmount()
 })
 
-test('Pause posts pause, and a paused band offers Resume', async ($, on) => {
+test('Stop sharing posts pause, and an Only you band offers Share to Lightbulb', async ($, on) => {
   const { calls, clock } = world(on, path => ({ status: 200, body: path === '/v1/decide' ? { ...base, paused: true } : base }))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await clock.settle()
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   await ui.press({ key: 'pause' })
   expect(calls[calls.length - 1]?.body).toEqual({ decision: 'pause' })
-  expect(await ui.find({ text: '○ Sharing paused' })).toBeDefined()
-  expect(await ui.find({ key: 'resume' })).toBeDefined()
+  expect(await ui.find({ text: new RegExp(`^${ONLY_YOU_LINE}`) })).toBeDefined()
+  expect(await ui.find({ key: 'resume' })).toMatchObject({ props: { label: 'Share to Lightbulb' } })
 })
 
 test('a missed poll keeps the last band for a minute, then hides it', async ($, on) => {
@@ -280,6 +280,98 @@ test('a not-shared answer hides the band at once', async ($, on) => {
   expect(await ui.drawn()).toEqual({ type: 'Text', children: [ENGINE] })
 })
 
+const ONLY_YOU: Reply = { status: 200, body: { shared: false } }
+
+test('a session that is not shared says Only you and offers Share to Lightbulb', async ($, on) => {
+  const { calls, clock } = world(on, () => ONLY_YOU)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^${ONLY_YOU_LINE}`) })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: / ctrl\+x tab, then s$/ })).toBeDefined()
+  const buttons = await ui.findAll({ type: 'Button' })
+  expect(buttons.map(b => [b.key, b.props.hotkey, b.props.label])).toEqual([['share', 's', 'Share to Lightbulb']])
+  expect(calls.every(c => c.method === 'GET')).toBe(true) // nothing is asked of the app until the person chooses
+  await ui.unmount()
+  const desktop = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await desktop.find({ text: /ctrl\+x tab/ })).toBeUndefined() // a desktop draws a native button
+  await desktop.unmount()
+})
+
+test('Share to Lightbulb names this session to the app and shows the shared band at once', async ($, on) => {
+  let state: Reply = ONLY_YOU
+  const { calls, clock } = world(on, path => (path === '/v1/share' ? ((state = { status: 200, body: base }), { status: 200, body: { shared: true, waiting: false } }) : state))
+  on('session.id', () => ({ value: 'conversation-1' }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'share' })
+  const asked = calls.find(c => c.url === 'http://lightbulb/v1/share')!
+  expect(asked).toMatchObject({ method: 'POST', socketPath: SOCKET })
+  expect(asked.body).toEqual({ sessionId: 'conversation-1' })
+  expect(await ui.find({ type: 'Text', text: '● Live in Lightbulb' })).toBeDefined() // no wait for the next poll
+  expect(await ui.find({ key: 'pause' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a shared session in a plain terminal says how to go live and offers nothing', async ($, on) => {
+  const { clock } = world(on, () => ({ status: 200, body: { shared: true } }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(GO_LIVE_LINE).toBe('○ Press ← once to go live')
+  expect(await ui.find({ type: 'Text', text: GO_LIVE_LINE })).toBeDefined()
+  expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('Stop sharing: the band says Only you and offers Share again', async ($, on) => {
+  let state: Reply = { status: 200, body: base }
+  const { clock } = world(on, path => (path === '/v1/decide' ? (state = ONLY_YOU) : state))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'pause' })
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^${ONLY_YOU_LINE}`) })).toBeDefined()
+  expect(await ui.find({ key: 'share' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /did not take that/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a stop the workspace has not taken yet says Stopping, not Only you', async ($, on) => {
+  let state: Reply = { status: 200, body: base }
+  const { clock } = world(on, path => (path === '/v1/decide' ? (state = { status: 200, body: { shared: false, stopping: true } }) : state))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'pause' })
+  expect(await ui.find({ type: 'Text', text: STOPPING_LINE })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^${ONLY_YOU_LINE}`) })).toBeUndefined()
+  expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+  state = ONLY_YOU // the app reached the workspace
+  await clock.advance(2000)
+  expect(await ui.find({ key: 'share' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a refused Share says why and keeps the offer', async ($, on) => {
+  let share: Reply | 'refuse' = { status: 404, body: { error: 'unknown_session', message: 'Lightbulb does not see this session yet. Wait a few seconds, then try again.' } }
+  const { clock, socket } = world(on, path => (path === '/v1/share' ? share : ONLY_YOU))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'share' })
+  expect(await ui.find({ type: 'Text', text: 'Lightbulb does not see this session yet. Wait a few seconds, then try again.' })).toBeDefined()
+  expect(await ui.find({ key: 'share' })).toBeDefined()
+  share = 'refuse'
+  await ui.press({ key: 'share' })
+  expect(await ui.find({ type: 'Text', text: 'Lightbulb did not answer. Open the Lightbulb app, then try again.' })).toBeDefined()
+  socket.live = false // sharing was switched off for this Mac: the app's socket is gone
+  await ui.press({ key: 'share' })
+  expect(await ui.find({ type: 'Text', text: /^Lightbulb is not sharing on this Mac\./ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('every band Button has its own hotkey', async ($, on) => {
   let state: SessionState = asking
   const { clock } = world(on, () => ({ status: 200, body: state }))
@@ -294,7 +386,7 @@ test('every band Button has its own hotkey', async ($, on) => {
   expect(await hotkeys()).toEqual({ pause: 'p', allow: 'a', decline: 'd' })
   state = { ...base, paused: true }
   await clock.advance(2000)
-  expect(await hotkeys()).toEqual({ resume: 'p' })
+  expect(await hotkeys()).toEqual({ resume: 's' }) // the same key as Share on a session that was never shared
 })
 
 // Prod 2026-10-07, Claude Code 2.1.292: `a` at the prompt typed "a"; only a click reached Allow.
@@ -303,7 +395,7 @@ test('every band Button has its own hotkey', async ($, on) => {
 test('the key hint names the way to the band and the letters that work there', () => {
   expect(keysHint(asking)).toBe('ctrl+x tab, then a or d · or click')
   expect(keysHint(base)).toBe('ctrl+x tab, then p')
-  expect(keysHint({ ...base, paused: true })).toBe('ctrl+x tab, then p')
+  expect(keysHint({ ...base, paused: true })).toBe('ctrl+x tab, then s')
 })
 
 test('the terminal band shows the key hint beside its buttons; a desktop, which has no chord, does not', async ($, on) => {
